@@ -129,7 +129,12 @@ SERVICE_MODEL = {
         "EnvironmentIdOutput": {"type": "structure", "members": {"EnvironmentId": {"shape": "String"}}},
         "EnvironmentOutput": {
             "type": "structure",
-            "members": {"EnvironmentId": {"shape": "String"}, "Status": {"shape": "String"}},
+            "members": {
+                "EnvironmentId": {"shape": "String"},
+                "Status": {"shape": "String"},
+                "EnvironmentName": {"shape": "String"},
+                "VpcConfig": {"shape": "VpcConfig"},
+            },
         },
         "EnvironmentList": {"type": "list", "member": {"shape": "EnvironmentOutput"}},
         "DescribeEnvironmentsOutput": {
@@ -687,7 +692,10 @@ def cmd_list(args) -> int:
                 status = client.get_environment_status(EnvironmentId=env_id).get("Status", "?")
             except Exception:
                 status = "?"
-        print(f"{env_id:<{width}}  {status}")
+        name = env.get("EnvironmentName")
+        vpc = (env.get("VpcConfig") or {}).get("VpcId")
+        extra = " ".join(x for x in (f"name={name}" if name else "", f"vpc={vpc}" if vpc else "") if x)
+        print(f"{env_id:<{width}}  {status}" + (f"  {extra}" if extra else ""))
     return 0
 
 
