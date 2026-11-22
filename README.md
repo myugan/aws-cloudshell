@@ -5,8 +5,10 @@ commands, and file transfer — without the AWS Console and without
 `aws configure add-model`.
 
 CloudShell has no public SDK. This script carries its own minimal botocore
-service model (eight operations), writes it to the botocore data path at
+service model (nine operations), writes it to the botocore data path at
 runtime, and drives `session-manager-plugin` over the resulting SSM session.
+Sessions use the `BASH` session type, so no tmux tab is created and there is
+nothing to leak.
 
 ## Requirements
 
@@ -45,5 +47,5 @@ create the environment if none exists.
 - **Not a tunnel.** The session is a PTY, so there is no local port
   forwarding — run `mysql`/`psql`/`curl` inside CloudShell.
 - **Short-lived.** Each command opens a session, exits the shell, and deletes
-  the SSM session, so tabs do not accumulate.
-- Environments suspend after ~20 minutes idle; an open session keeps it awake.
+  the SSM session. `shell` also sends `sendHeartBeat` every five minutes, so
+  an idle environment is not suspended underneath you.

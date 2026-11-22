@@ -44,6 +44,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import uuid
@@ -109,6 +110,11 @@ SERVICE_MODEL = {
             "http": {"method": "POST", "requestUri": "/deleteSession"},
             "input": {"shape": "DeleteSessionInput"},
         },
+        "SendHeartBeat": {
+            "name": "SendHeartBeat",
+            "http": {"method": "POST", "requestUri": "/sendHeartBeat"},
+            "input": {"shape": "EnvironmentIdInput"},
+        },
     },
     "shapes": {
         "String": {"type": "string"},
@@ -153,7 +159,7 @@ SERVICE_MODEL = {
         },
         "CreateSessionInput": {
             "type": "structure",
-            "required": ["EnvironmentId", "SessionType", "TabId"],
+            "required": ["EnvironmentId", "SessionType"],
             "members": {
                 "EnvironmentId": {"shape": "String"},
                 "SessionType": {"shape": "String"},
@@ -373,8 +379,7 @@ class Session:
         os.close(slave)
 
     def _set_size(self, cols: int, rows: int) -> None:
-        # tmux repaints the whole pane on a resize, which would redraw the
-        # setup transcript. Only emit a real change.
+        # Only emit a real change; a no-op resize still raises SIGWINCH.
         if (cols, rows) == (self._cols, self._rows):
             return
         try:
@@ -478,26 +483,6 @@ class Session:
         except TimeoutError:
             die(f"remote `stty {opts}` did not complete")
 
-    def _clear_screen(self) -> None:
-        """Erase the setup transcript from the pane.
-
-        tmux repaints the pane's visible screen on resize, so anything left
-        there (handshake echoes, prompts) would reappear later. The trailing
-        clear runs after the marker and leaves only the prompt on screen.
-        """
-        seed = "csclear" + uuid.uuid4().hex[:8]
-        token = base64.b64encode((seed + "\n").encode())
-        # ED 2 clears the visible screen and ED 3 the scrollback; without the
-        # latter, a resize repaints the setup transcript. The wipe runs twice:
-        # once before the marker and once after, so the marker never remains.
-        wipe = "printf '\\033[H\\033[2J\\033[3J'"
-        self.write(f"{wipe}; echo {seed} | base64; {wipe}\n")
-        try:
-            self.wait_for(token, 15)
-        except TimeoutError:
-            die("remote `clear` did not complete")
-        self._buf = b""
-
     def start_noninteractive(self) -> None:
         self.wait_ready()
         self.harden_tty()
@@ -519,7 +504,6 @@ class Session:
         # before this token. That makes the handoff deterministic instead of
         # racing a timer.
         self._apply_stty("sane")
-        self._clear_screen()
         # The plugin re-enables ISIG a few seconds after connecting; do this
         # last so Ctrl-C is a byte for the remote shell, not a local signal.
         self.harden_tty()
@@ -622,12 +606,7 @@ class Session:
             return 0
 
     def quit_shell(self, timeout: float = 5) -> None:
-        """Exit the remote shell so its tmux session dies with it.
-
-        Terminating the plugin alone leaves the container-side tmux session and
-        client running: one leaked tab per command, until CloudShell refuses
-        new sessions with "Concurrent command limit exceeded".
-        """
+        """Exit the remote shell so the container-side session ends with it."""
         if self.proc.poll() is not None:
             return
         try:
@@ -662,12 +641,12 @@ def find_plugin() -> str:
 
 
 def open_session(client, region: str, env_id: str, cols: int = 132, rows: int = 43) -> Session:
-    tab_id = str(uuid.uuid4())
+    # BASH needs no TabId and creates no tmux session, so there is nothing to
+    # clean up or repaint. (TMUX would need a TabId and leaks a tab per session.)
     payload = guard(
         client.create_session,
         EnvironmentId=env_id,
-        SessionType="TMUX",
-        TabId=tab_id,
+        SessionType="BASH",
         QCliDisabled=True,
     )
     slim = {k: payload[k] for k in ("SessionId", "TokenValue", "StreamUrl")}
@@ -675,12 +654,7 @@ def open_session(client, region: str, env_id: str, cols: int = 132, rows: int = 
 
 
 def end_session(client, env_id: str, shell: Session) -> None:
-    """Exit the remote shell, close the plugin, then free the SSM session.
-
-    DeleteSession alone leaves the container-side tmux session and client
-    running: one leaked tab per command, until CloudShell refuses new sessions
-    with "Concurrent command limit exceeded".
-    """
+    """Exit the remote shell, close the plugin, then free the SSM session."""
     shell.quit_shell()
     shell.close()
     try:
@@ -760,17 +734,34 @@ def _lifecycle(name: str):
     return run
 
 
+def keep_alive(client, env_id: str) -> threading.Event:
+    """SendHeartBeat is what defers an idle suspend; an open session does not."""
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(300):
+            try:
+                client.send_heart_beat(EnvironmentId=env_id)
+            except Exception:
+                return
+
+    threading.Thread(target=beat, daemon=True).start()
+    return stop
+
+
 def cmd_shell(args) -> int:
     client, session, region = make_client(args)
     env_id = resolve_env(client, args.env_id, create=not args.no_create)
     wait_running(client, env_id)
     shell = open_session(client, region, env_id, *terminal_size())
+    stop = keep_alive(client, env_id)
     try:
         inject = [] if args.no_creds else credentials_export(session, region)
         shell.start_interactive(inject)
         log(f"connected to {env_id} ({region}); exit to disconnect")
         return shell.interactive()
     finally:
+        stop.set()
         end_session(client, env_id, shell)
 
 
