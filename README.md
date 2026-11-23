@@ -21,31 +21,81 @@ nothing to leak.
 
 ```bash
 python3 cloudshell.py shell                          # interactive shell
+python3 cloudshell.py serve                          # hold one session; share it over a socket
 python3 cloudshell.py exec -- 'whoami; uname -a'     # run and print output
 python3 cloudshell.py put ./dump.sql /home/cloudshell-user/dump.sql
 python3 cloudshell.py get /home/cloudshell-user/report.json ./report.json
 python3 cloudshell.py list
 ```
 
-Global options: `--profile`, `--region`, `-e/--env-id`. `shell` and `exec`
-create the environment if none exists.
+Global options: `--profile`, `--region`, `-e/--env-id`. `shell`, `serve`,
+`exec`, `put`, `get` and `setup` create the environment if none exists.
 
 | Command | What it does |
 |---|---|
 | `shell` | Interactive PTY shell; injects your credentials by default |
+| `serve` | Holds one session and runs jobs for other invocations over a unix socket |
 | `exec` | Runs a script, prints output, exits with the remote status |
 | `put` / `get` | Chunked base64 transfer over the session |
+| `setup` | Installs `cloudflared` into `~/.local/bin` (idempotent; `--force` reinstalls) |
 | `list` / `create` / `status` / `start` / `stop` / `delete` | Environment lifecycle, including VPC environments |
 | `creds` | Prints frozen credentials for manual injection |
 | `model` | Shows the cached model; `--install-cli` installs it for `aws cloudshell` |
 
+## cloudflared
+
+`setup` downloads the latest static `cloudflared` binary for the environment's
+architecture into `~/.local/bin`, which is already on `PATH` and inside the
+1 GB persistent home directory. Re-running it is cheap; `--force` re-downloads.
+The install needs no credentials, and `setup` never exports any.
+
+```bash
+python3 cloudshell.py setup
+```
+
+Run a token-based tunnel, with the token created in the Cloudflare dashboard:
+
+```bash
+cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN"
+```
+
+`cloudflared tunnel login` cannot complete inside CloudShell: it waits for a
+callback on the container's `localhost`, which the browser approving the
+request cannot reach. `cloudflared service install` also fails, because there
+is no systemd. A tunnel lives only as long as the shell session — CloudShell
+suspends after 20–30 minutes of inactivity and ends sessions after 12 hours.
+
+## Sharing one session
+
+A session ticket is single-use: `SessionId`, `TokenValue` and `StreamUrl` come
+back once from `CreateSession`, and a second websocket on the same token
+displaces the first — the existing shell dies with
+`Cannot perform start session: websocket: close sent`. There is no attach call
+in the API, so the only way to reuse a session is to share the PTY that owns it.
+
+`serve` does exactly that. It holds the session and listens on
+`~/.aws-cloudshell/<env-id>.sock`:
+
+```bash
+python3 cloudshell.py serve                      # in one terminal (interactive, or headless)
+python3 cloudshell.py exec --via ~/.aws-cloudshell/<env-id>.sock -- 'ls /tmp'
+python3 cloudshell.py get --via ~/.aws-cloudshell/<env-id>.sock /home/cloudshell-user/x.json ./x.json
+```
+
+`--via` is optional: `exec`, `put` and `get` reuse any socket they find and
+fall back to opening a session of their own. Jobs from concurrent clients share
+one remote shell and are serialized; the remote status is preserved. Stop the
+server with `^C` (interactive) or `SIGTERM`; the socket is removed either way.
+
 ## Notes
 
 - **Undocumented API.** AWS can change it without notice.
-- **Credentials.** Programmatic sessions get none. `shell` and `exec` export
-  your local frozen credentials into the session; use `--no-creds` to skip.
+- **Credentials.** Programmatic sessions get none. `shell`, `serve` and `exec`
+  export your local frozen credentials into the session; use `--no-creds` to
+  skip.
 - **Not a tunnel.** The session is a PTY, so there is no local port
   forwarding — run `mysql`/`psql`/`curl` inside CloudShell.
 - **Short-lived.** Each command opens a session, exits the shell, and deletes
-  the SSM session. `shell` also sends `sendHeartBeat` every five minutes, so
-  an idle environment is not suspended underneath you.
+  the SSM session. `shell` and `serve` also send `sendHeartBeat` every five
+  minutes, so an idle environment is not suspended underneath you; a `serve`
+  socket keeps working until you stop it.

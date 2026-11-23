@@ -2,11 +2,12 @@
 """Use AWS CloudShell from your terminal, with no Console and no `aws configure add-model`.
 
 CloudShell has no public SDK. This script carries its own minimal botocore
-service model — the eight operations it uses — writes it to the botocore data
+service model — the nine operations it uses — writes it to the botocore data
 path, then drives `session-manager-plugin` to give you a real interactive shell
 or one-shot command execution.
 
     ./cloudshell.py shell                     # interactive shell (creates env if needed)
+    ./cloudshell.py serve                     # hold one session, serve jobs over a socket
     ./cloudshell.py exec -- 'whoami; uname -a'
     ./cloudshell.py put ./dump.sql /home/cloudshell-user/dump.sql
     ./cloudshell.py get /home/cloudshell-user/report.json ./report.json
@@ -40,6 +41,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -669,6 +671,299 @@ def end_session(client, env_id: str, shell: Session) -> None:
             log(f"delete_session failed: {exc}")
 
 
+# --------------------------------------------------------------- broker
+#
+# One `serve` process owns the PTY. Everything else talks to it over a unix
+# socket, so `get`/`put`/`exec` reuse the interactive session you already have
+# instead of calling CreateSession again. Session tickets are single-use: a
+# second websocket on the same token displaces the first, so sharing the *PTY*
+# is the only way to share a session.
+
+SOCK_DIR = Path.home() / ".aws-cloudshell"
+BUFFER_LIMIT = 8 * 1024 * 1024
+
+
+def socket_path(env_id: str) -> Path:
+    return SOCK_DIR / f"{env_id}.sock"
+
+
+def find_socket(env_id: str | None) -> str | None:
+    if env_id:
+        path = socket_path(env_id)
+        return str(path) if path.exists() else None
+    try:
+        candidates = sorted(SOCK_DIR.glob("*.sock"))
+    except OSError:
+        return None
+    return str(candidates[0]) if candidates else None
+
+
+class Pump(threading.Thread):
+    """The only reader of the session PTY.
+
+    Bytes land in a rolling buffer that clients scan for markers, and are
+    mirrored to the attached terminal when there is one.
+    """
+
+    def __init__(self, shell: Session, mirror: int | None = None) -> None:
+        super().__init__(daemon=True)
+        self.shell = shell
+        self.mirror = mirror
+        self._buf = bytearray()
+        self._base = 0
+        self._closed = False
+        self._stop = False
+        self._cond = threading.Condition()
+
+    def run(self) -> None:
+        while not self._stop:
+            try:
+                ready, _, _ = select.select([self.shell.master], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                if self.shell.proc.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = os.read(self.shell.master, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            with self._cond:
+                self._buf += chunk
+                if len(self._buf) > BUFFER_LIMIT:
+                    drop = len(self._buf) - BUFFER_LIMIT // 2
+                    del self._buf[:drop]
+                    self._base += drop
+                self._cond.notify_all()
+            if self.mirror is not None:
+                try:
+                    write_all(self.mirror, chunk)
+                except OSError:
+                    self.mirror = None
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    def stop(self) -> None:
+        self._stop = True
+        self.join(2)
+
+    def mark(self) -> int:
+        with self._cond:
+            return self._base + len(self._buf)
+
+    def wait_for(self, marker: bytes, start: int, timeout: float) -> tuple[bytes, int]:
+        """Wait for marker at/after offset start; return (bytes before it, offset after it)."""
+        deadline = time.time() + timeout
+        with self._cond:
+            while True:
+                low = max(0, start - self._base)
+                index = self._buf.find(marker, low)
+                if index >= 0:
+                    return bytes(self._buf[low:index]), self._base + index + len(marker)
+                if self._closed:
+                    raise RuntimeError("session closed before marker")
+                left = deadline - time.time()
+                if left <= 0:
+                    raise TimeoutError("marker not seen")
+                self._cond.wait(min(left, 0.2))
+
+    def wait_line(self, start: int, timeout: float) -> bytes:
+        deadline = time.time() + timeout
+        with self._cond:
+            while True:
+                low = max(0, start - self._base)
+                index = self._buf.find(b"\n", low)
+                if index >= 0:
+                    return bytes(self._buf[low:index])
+                if self._closed or time.time() > deadline:
+                    return b""
+                self._cond.wait(0.2)
+
+
+class Broker:
+    """Runs jobs against one live session; concurrent clients are serialized."""
+
+    def __init__(self, shell: Session, pump: Pump, env_id: str) -> None:
+        self.shell = shell
+        self.pump = pump
+        self.env_id = env_id
+        self._write_lock = threading.Lock()
+        self._job_lock = threading.Lock()
+
+    def write(self, data) -> None:
+        with self._write_lock:
+            self.shell.write(data)
+
+    def run(self, script: str, timeout: float = 300) -> tuple[str, int]:
+        with self._job_lock:
+            nonce = uuid.uuid4().hex[:10]
+            begin = f"__CS_BEGIN_{nonce}__".encode()
+            end = f"__CS_END_{nonce}__".encode()
+            quiet = f"__CS_QUIET_{nonce}__".encode()
+            remote = f"/tmp/.cloudshell-{nonce}.sh"
+            b64 = base64.b64encode(script.encode()).decode()
+            # An interactive session runs with echo on, so the injected line
+            # would be echoed back into the transcript and into the result.
+            # Switch echo off and prove it took effect before typing the job.
+            # The proof is base64 of the seed: the pty echoes the command, which
+            # contains the seed but never its encoding.
+            seed = f"__CS_QUIET_{nonce}__"
+            quiet = base64.b64encode((seed + "\n").encode())
+            start = self.pump.mark()
+            self.write(f"stty -echo; echo {seed} | base64\n")
+            self.pump.wait_for(quiet, start, 20)
+            start = self.pump.mark()
+            quoted = shlex.quote(remote)
+            try:
+                self.write(
+                    f"printf %s '{b64}' | base64 -d > {quoted}; echo {begin.decode()}; "
+                    f"bash {quoted}; rc=$?; echo {end.decode()}:$rc; rm -f {quoted}\n"
+                )
+                _, after_begin = self.pump.wait_for(begin, start, 20)
+                body, after_end = self.pump.wait_for(end, after_begin, timeout)
+                rc_line = self.pump.wait_line(after_end, 5)
+            finally:
+                self.write("stty echo\n")
+            match = re.match(rb":\s*(\d+)", rc_line)
+            return body.decode("utf-8", "replace"), (int(match.group(1)) if match else 1)
+
+    def handle(self, request: dict) -> dict:
+        op = request.get("op")
+        try:
+            if op == "ping":
+                return {"ok": True, "env": self.env_id}
+            if op == "run":
+                out, rc = self.run(request["script"], float(request.get("timeout", 300)))
+                return {"ok": True, "out": out, "rc": rc}
+            if op == "stat":
+                out, rc = self.run(f"stat -c %s -- {shlex.quote(request['path'])}\n", 60)
+                if rc != 0:
+                    return {"ok": False, "error": out.strip()}
+                return {"ok": True, "size": int(out.strip().splitlines()[-1])}
+            if op == "read":
+                cmd = (
+                    f"dd if={shlex.quote(request['path'])} bs={CHUNK} "
+                    f"skip={int(request.get('offset', 0))} count=1 2>/dev/null | base64\n"
+                )
+                out, rc = self.run(cmd, 120)
+                if rc != 0:
+                    return {"ok": False, "error": out.strip()}
+                return {"ok": True, "data": re.sub(r"\s+", "", clean_output(out))}
+            if op == "write":
+                append = ">>" if request.get("append") else ">"
+                cmd = (
+                    f"printf %s '{request['data']}' | base64 -d {append} "
+                    f"{shlex.quote(request['path'])}\n"
+                )
+                out, rc = self.run(cmd, 120)
+                if rc != 0:
+                    return {"ok": False, "error": out.strip()}
+                return {"ok": True}
+            return {"ok": False, "error": f"unknown op {op!r}"}
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": f"bad request: {exc!r}"}
+        except (TimeoutError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+class BrokerClient:
+    """Client side of the unix socket; same run() shape as Session."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(3600)
+        try:
+            self.sock.connect(path)
+        except OSError:
+            self.sock.close()
+            raise
+        self._reader = self.sock.makefile("rb")
+
+    def call(self, request: dict) -> dict:
+        self.sock.sendall(json.dumps(request).encode() + b"\n")
+        line = self._reader.readline(1 << 24)
+        if not line:
+            raise RuntimeError("broker closed the connection")
+        return json.loads(line)
+
+    def run(self, script: str, timeout: float = 120) -> tuple[str, int]:
+        response = self.call({"op": "run", "script": script, "timeout": timeout})
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "run failed"))
+        return response.get("out", ""), int(response.get("rc", 1))
+
+    def close(self) -> None:
+        try:
+            self._reader.close()
+        finally:
+            self.sock.close()
+
+    def __enter__(self) -> "BrokerClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class SessionTransport:
+    """Direct transport: owns the session it talks through."""
+
+    def __init__(self, shell: Session, client, env_id: str, preamble: list[str]) -> None:
+        self.shell = shell
+        self.client = client
+        self.env_id = env_id
+        self.preamble = preamble
+
+    def run(self, script: str, timeout: float = 120) -> tuple[str, int]:
+        if self.preamble:
+            script = "\n".join([*self.preamble, script])
+        return self.shell.run(script, timeout=timeout)
+
+    def close(self) -> None:
+        end_session(self.client, self.env_id, self.shell)
+
+
+def open_transport(args, inject_creds: bool = True):
+    """Reuse a running `serve` broker if one answers, else open a session."""
+    via = getattr(args, "via", None)
+    path = via or find_socket(getattr(args, "env_id", None))
+    if path:
+        try:
+            return BrokerClient(path)
+        except (OSError, ValueError) as exc:
+            if via:
+                die(f"cannot reach broker at {via}: {exc}")
+    client, session, region = make_client(args)
+    env_id = resolve_env(client, args.env_id, create=not getattr(args, "no_create", False))
+    wait_running(client, env_id)
+    shell = open_session(client, region, env_id)
+    shell.start_noninteractive()
+    preamble = [] if not inject_creds else credentials_export(session, region)
+    return SessionTransport(shell, client, env_id, preamble)
+
+
+def _serve_conn(conn, broker: Broker) -> None:
+    try:
+        with conn:
+            for line in conn.makefile("rb"):
+                if not line.strip():
+                    continue
+                try:
+                    request = json.loads(line)
+                except ValueError:
+                    response = {"ok": False, "error": "bad json"}
+                else:
+                    response = broker.handle(request)
+                conn.sendall(json.dumps(response).encode() + b"\n")
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------------------ commands
 
 
@@ -782,24 +1077,62 @@ def cmd_exec(args) -> int:
     if not command.strip():
         die("empty command")
 
-    client, session, region = make_client(args)
-    env_id = resolve_env(client, args.env_id, create=not args.no_create)
-    wait_running(client, env_id)
-    shell = open_session(client, region, env_id)
+    transport = open_transport(args, inject_creds=not args.no_creds)
     try:
-        preamble = [] if args.no_creds else credentials_export(session, region)
-        script = "\n".join([*preamble, command]) + "\n"
-        shell.start_noninteractive()
-        out, rc = shell.run(script, timeout=args.timeout)
-        out = clean_output(out).lstrip("\n")
-        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
-        return rc
+        out, rc = transport.run(command + "\n", timeout=args.timeout)
     finally:
-        end_session(client, env_id, shell)
+        transport.close()
+    out = clean_output(out).lstrip("\n")
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    return rc
 
 
-def _remote_stat(shell: Session, path: str) -> int:
-    out, rc = shell.run(f"stat -c %s -- {shlex.quote(path)}\n", timeout=30)
+CLOUDFLARED_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
+CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+
+
+def cmd_setup(args) -> int:
+    """Install cloudflared into the environment's persistent home directory."""
+
+    def last_line(out: str) -> str:
+        lines = [line.strip() for line in clean_output(out).splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    # No AWS credentials are needed for the download, so none are exported.
+    transport = open_transport(args, inject_creds=False)
+    binary = "$HOME/.local/bin/cloudflared"
+    try:
+        out, _ = transport.run("uname -m\n", timeout=30)
+        arch = last_line(out)
+        target = CLOUDFLARED_ARCH.get(arch)
+        if not target:
+            die(f"unsupported architecture {arch or 'unknown'!r}; expected x86_64 or aarch64")
+
+        if not args.force:
+            out, _ = transport.run(f"test -x {binary} && {binary} --version || echo missing\n", timeout=60)
+            version = last_line(out)
+            if version.startswith("cloudflared version"):
+                print(f"{version} at ~/.local/bin/cloudflared")
+                return 0
+
+        url = CLOUDFLARED_URL.format(arch=target)
+        log(f"installing cloudflared ({target}) into ~/.local/bin")
+        out, rc = transport.run(
+            f'mkdir -p "$HOME/.local/bin" && '
+            f"curl -fsSL --max-time 300 -o {binary}.download {url} && "
+            f"chmod +x {binary}.download && mv -f {binary}.download {binary} && {binary} --version\n",
+            timeout=360,
+        )
+        if rc != 0:
+            die(f"cloudflared install failed: {clean_output(out).strip()}")
+        print(f"{last_line(out) or 'cloudflared'} at ~/.local/bin/cloudflared")
+        return 0
+    finally:
+        transport.close()
+
+
+def _remote_stat(transport, path: str) -> int:
+    out, rc = transport.run(f"stat -c %s -- {shlex.quote(path)}\n", timeout=60)
     if rc != 0:
         die(f"cannot stat remote file {path}: {out.strip()}")
     try:
@@ -813,41 +1146,33 @@ def cmd_put(args) -> int:
     if not local.is_file():
         die(f"no such local file: {local}")
     data = local.read_bytes()
-    client, session, region = make_client(args)
-    env_id = resolve_env(client, args.env_id, create=not args.no_create)
-    wait_running(client, env_id)
-    shell = open_session(client, region, env_id)
+    transport = open_transport(args)
     remote = shlex.quote(args.remote)
     try:
-        shell.start_noninteractive()
         total = max(1, (len(data) + CHUNK - 1) // CHUNK)
         for index in range(total):
             chunk = base64.b64encode(data[index * CHUNK : (index + 1) * CHUNK]).decode()
             op = ">" if index == 0 else ">>"
-            out, rc = shell.run(f"printf %s '{chunk}' | base64 -d {op} {remote}\n", timeout=120)
+            out, rc = transport.run(f"printf %s '{chunk}' | base64 -d {op} {remote}\n", timeout=120)
             if rc != 0:
                 die(f"upload failed at chunk {index + 1}/{total}: {out.strip()}")
             log(f"uploaded chunk {index + 1}/{total} ({(index + 1) * CHUNK if index + 1 < total else len(data)} bytes)")
         print(args.remote)
         return 0
     finally:
-        end_session(client, env_id, shell)
+        transport.close()
 
 
 def cmd_get(args) -> int:
-    client, session, region = make_client(args)
-    env_id = resolve_env(client, args.env_id, create=not args.no_create)
-    wait_running(client, env_id)
-    shell = open_session(client, region, env_id)
+    transport = open_transport(args)
     remote = shlex.quote(args.remote)
     try:
-        shell.start_noninteractive()
-        size = _remote_stat(shell, args.remote)
+        size = _remote_stat(transport, args.remote)
         total = max(1, (size + CHUNK - 1) // CHUNK)
         blob = bytearray()
         for index in range(total):
             cmd = f"dd if={remote} bs={CHUNK} skip={index} count=1 2>/dev/null | base64\n"
-            out, rc = shell.run(cmd, timeout=120)
+            out, rc = transport.run(cmd, timeout=120)
             if rc != 0:
                 die(f"download failed at chunk {index + 1}/{total}: {out.strip()}")
             try:
@@ -861,7 +1186,90 @@ def cmd_get(args) -> int:
         print(args.local)
         return 0
     finally:
+        transport.close()
+
+
+def cmd_serve(args) -> int:
+    """Hold one session and let other invocations run jobs inside it over a socket."""
+    client, session, region = make_client(args)
+    env_id = resolve_env(client, args.env_id, create=not args.no_create)
+    wait_running(client, env_id)
+    path = Path(args.socket).expanduser() if args.socket else socket_path(env_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            BrokerClient(str(path)).call({"op": "ping"})
+            die(f"{path} is already serving; stop that process or pass --socket")
+        except (OSError, RuntimeError, ValueError):
+            path.unlink(missing_ok=True)
+
+    shell = open_session(client, region, env_id, *terminal_size())
+    beat = keep_alive(client, env_id)
+    interactive = sys.stdin.isatty()
+    stdin = sys.stdin.fileno()
+    attrs = None
+    pump = None
+    listener = None
+    previous_term = signal.getsignal(signal.SIGTERM)
+    previous_hup = signal.getsignal(signal.SIGHUP)
+    try:
+        def _stop(signum, frame):
+            raise SystemExit(0)
+
+        # A closed terminal sends HUP, not TERM; both must clean up the socket.
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGHUP, _stop)
+        inject = [] if args.no_creds else credentials_export(session, region)
+        if interactive:
+            shell.start_interactive(inject)
+            attrs = termios.tcgetattr(stdin)
+            tty.setraw(stdin)
+        else:
+            shell.start_noninteractive()
+        pump = Pump(shell, mirror=sys.stdout.fileno() if interactive else None)
+        pump.start()
+        broker = Broker(shell, pump, env_id)
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        os.chmod(path, 0o600)
+        listener.listen(8)
+        log(f"serving {env_id} on {path}")
+        log(f"other terminals: put/get/exec --via {path}")
+
+        while shell.proc.poll() is None:
+            fds = [listener, stdin] if interactive else [listener]
+            try:
+                ready, _, _ = select.select(fds, [], [], 0.5)
+            except (OSError, ValueError):
+                break
+            if pump._closed:
+                break
+            if interactive and stdin in ready:
+                data = os.read(stdin, 65536)
+                if not data:
+                    break
+                broker.write(data)
+            if listener in ready:
+                conn, _ = listener.accept()
+                threading.Thread(target=_serve_conn, args=(conn, broker), daemon=True).start()
+        return 0
+    finally:
+        if attrs is not None:
+            try:
+                termios.tcsetattr(stdin, termios.TCSAFLUSH, attrs)
+            except (OSError, termios.error):
+                pass
+            reset_terminal(sys.stdout.fileno())
+        if listener is not None:
+            listener.close()
+        path.unlink(missing_ok=True)
+        if pump is not None:
+            pump.stop()
+        beat.set()
         end_session(client, env_id, shell)
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGHUP, previous_hup)
 
 
 def cmd_creds(args) -> int:
@@ -933,16 +1341,24 @@ def build_parser() -> argparse.ArgumentParser:
     add("shell", cmd_shell, "interactive shell", create_flags=True).add_argument(
         "--no-creds", action="store_true", help="do not inject local AWS credentials"
     )
+    p = add("serve", cmd_serve, "hold a session and serve jobs over a unix socket", create_flags=True)
+    p.add_argument("--no-creds", action="store_true", help="do not inject local AWS credentials")
+    p.add_argument("--socket", help="socket path (default ~/.aws-cloudshell/<env-id>.sock)")
     p = add("exec", cmd_exec, "run a command and print its output", create_flags=True)
     p.add_argument("--no-creds", action="store_true", help="do not inject local AWS credentials")
     p.add_argument("--timeout", type=int, default=300, help="seconds to wait for the command (default 300)")
+    p.add_argument("--via", help="run through a `serve` socket instead of a new session")
     p.add_argument("command", nargs=argparse.REMAINDER, help="command to run (use -- before it)")
     p = add("put", cmd_put, "upload a file over the session", create_flags=True)
+    p.add_argument("--via", help="send through a `serve` socket instead of a new session")
     p.add_argument("local")
     p.add_argument("remote")
     p = add("get", cmd_get, "download a file over the session", create_flags=True)
+    p.add_argument("--via", help="fetch through a `serve` socket instead of a new session")
     p.add_argument("remote")
     p.add_argument("local")
+    p = add("setup", cmd_setup, "install cloudflared in the environment", create_flags=True)
+    p.add_argument("--force", action="store_true", help="reinstall even if cloudflared is present")
     p = add("creds", cmd_creds, "print local credentials for manual injection")
     p.add_argument("--format", choices=("export", "json"), default="export")
     p = add("model", cmd_model, "show or install the service model")
