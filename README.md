@@ -20,6 +20,7 @@ nothing to leak.
 ## Usage
 
 ```bash
+python3 cloudshell.py                                # interactive prompt (one session)
 python3 cloudshell.py shell                          # interactive shell
 python3 cloudshell.py serve                          # hold one session; share it over a socket
 python3 cloudshell.py exec -- 'whoami; uname -a'     # run and print output
@@ -28,11 +29,12 @@ python3 cloudshell.py get /home/cloudshell-user/report.json ./report.json
 python3 cloudshell.py list
 ```
 
-Global options: `--profile`, `--region`, `-e/--env-id`. `shell`, `serve`,
-`exec`, `put`, `get` and `setup` create the environment if none exists.
+Global options: `--profile`, `--region`, `-e/--env-id`. Commands that need a
+session create the environment if none exists; `--no-create` fails instead.
 
 | Command | What it does |
 |---|---|
+| `repl` (or no command) | Interactive prompt over one session; see below |
 | `shell` | Interactive PTY shell; injects your credentials by default |
 | `serve` | Holds one session and runs jobs for other invocations over a unix socket |
 | `exec` | Runs a script, prints output, exits with the remote status |
@@ -41,6 +43,31 @@ Global options: `--profile`, `--region`, `-e/--env-id`. `shell`, `serve`,
 | `list` / `create` / `status` / `start` / `stop` / `delete` | Environment lifecycle, including VPC environments |
 | `creds` | Prints frozen credentials for manual injection |
 | `model` | Shows the cached model; `--install-cli` installs it for `aws cloudshell` |
+
+## Interactive prompt
+
+No command (or `repl`) keeps one session open and runs commands from a prompt:
+
+```bash
+python3 cloudshell.py                     # prompt; injects credentials like `exec`
+python3 cloudshell.py repl --no-creds     # prompt without exporting credentials
+```
+
+```text
+cloudshell> exec uname -m
+cloudshell> put ./dump.sql /home/cloudshell-user/dump.sql
+cloudshell> get /home/cloudshell-user/report.json ./report.json
+cloudshell> setup
+```
+
+`list`, `exec`, `put`, `get`, `setup`, `shell`, `help` and `exit` are
+available. The session opens on the first command that needs it. `shell`
+closes the prompt's session and hands over to an interactive one; the next
+command opens a fresh session. A failed command prints its error and leaves
+the prompt running.
+
+Each `exec` runs in a fresh bash, so `cd` and exported variables do not carry
+over between commands; use `shell` when you need shell state.
 
 ## cloudflared
 

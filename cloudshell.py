@@ -1068,6 +1068,13 @@ def cmd_shell(args) -> int:
         end_session(client, env_id, shell)
 
 
+def run_exec(transport, command: str, timeout: int = 300) -> int:
+    out, rc = transport.run(command + "\n", timeout=timeout)
+    out = clean_output(out).lstrip("\n")
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    return rc
+
+
 def cmd_exec(args) -> int:
     command = " ".join(args.command).strip()
     if not command:
@@ -1079,56 +1086,185 @@ def cmd_exec(args) -> int:
 
     transport = open_transport(args, inject_creds=not args.no_creds)
     try:
-        out, rc = transport.run(command + "\n", timeout=args.timeout)
+        return run_exec(transport, command, args.timeout)
     finally:
         transport.close()
-    out = clean_output(out).lstrip("\n")
-    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
-    return rc
 
 
 CLOUDFLARED_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
 CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
 
 
-def cmd_setup(args) -> int:
+def run_setup(transport, force: bool = False) -> int:
     """Install cloudflared into the environment's persistent home directory."""
 
     def last_line(out: str) -> str:
         lines = [line.strip() for line in clean_output(out).splitlines() if line.strip()]
         return lines[-1] if lines else ""
 
+    binary = "$HOME/.local/bin/cloudflared"
+    out, _ = transport.run("uname -m\n", timeout=30)
+    arch = last_line(out)
+    target = CLOUDFLARED_ARCH.get(arch)
+    if not target:
+        die(f"unsupported architecture {arch or 'unknown'!r}; expected x86_64 or aarch64")
+
+    if not force:
+        out, _ = transport.run(f"test -x {binary} && {binary} --version || echo missing\n", timeout=60)
+        version = last_line(out)
+        if version.startswith("cloudflared version"):
+            print(f"{version} at ~/.local/bin/cloudflared")
+            return 0
+
+    url = CLOUDFLARED_URL.format(arch=target)
+    log(f"installing cloudflared ({target}) into ~/.local/bin")
+    out, rc = transport.run(
+        f'mkdir -p "$HOME/.local/bin" && '
+        f"curl -fsSL --max-time 300 -o {binary}.download {url} && "
+        f"chmod +x {binary}.download && mv -f {binary}.download {binary} && {binary} --version\n",
+        timeout=360,
+    )
+    if rc != 0:
+        die(f"cloudflared install failed: {clean_output(out).strip()}")
+    print(f"{last_line(out) or 'cloudflared'} at ~/.local/bin/cloudflared")
+    return 0
+
+
+def cmd_setup(args) -> int:
     # No AWS credentials are needed for the download, so none are exported.
     transport = open_transport(args, inject_creds=False)
-    binary = "$HOME/.local/bin/cloudflared"
     try:
-        out, _ = transport.run("uname -m\n", timeout=30)
-        arch = last_line(out)
-        target = CLOUDFLARED_ARCH.get(arch)
-        if not target:
-            die(f"unsupported architecture {arch or 'unknown'!r}; expected x86_64 or aarch64")
-
-        if not args.force:
-            out, _ = transport.run(f"test -x {binary} && {binary} --version || echo missing\n", timeout=60)
-            version = last_line(out)
-            if version.startswith("cloudflared version"):
-                print(f"{version} at ~/.local/bin/cloudflared")
-                return 0
-
-        url = CLOUDFLARED_URL.format(arch=target)
-        log(f"installing cloudflared ({target}) into ~/.local/bin")
-        out, rc = transport.run(
-            f'mkdir -p "$HOME/.local/bin" && '
-            f"curl -fsSL --max-time 300 -o {binary}.download {url} && "
-            f"chmod +x {binary}.download && mv -f {binary}.download {binary} && {binary} --version\n",
-            timeout=360,
-        )
-        if rc != 0:
-            die(f"cloudflared install failed: {clean_output(out).strip()}")
-        print(f"{last_line(out) or 'cloudflared'} at ~/.local/bin/cloudflared")
-        return 0
+        return run_setup(transport, args.force)
     finally:
         transport.close()
+
+
+REPL_HELP = """\
+exec <command>          run a command in the session
+put <local> <remote>    upload a file
+get <remote> <local>    download a file
+setup [--force]         install cloudflared
+list                    list environments
+shell                   hand over to an interactive shell (ends this session)
+help                    show this text
+exit                    close the session and quit"""
+
+
+class Repl:
+    """One session, many commands: the prompt wraps the transport workers."""
+
+    def __init__(self, args) -> None:
+        self.args = args
+        self.transport = None
+
+    def session(self):
+        if self.transport is None:
+            self.transport = open_transport(self.args, inject_creds=not self.args.no_creds)
+            if isinstance(self.transport, SessionTransport):
+                target = self.transport.env_id
+            else:
+                target = Path(self.transport.path).stem
+            log(f"session {target}")
+        return self.transport
+
+    def reset(self) -> None:
+        transport, self.transport = self.transport, None
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                # Teardown must not mask the command's own error or kill the prompt.
+                pass
+
+    def dispatch(self, line: str) -> None:
+        parts = line.split(None, 1)
+        name = parts[0]
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if name in ("exit", "quit"):
+            raise EOFError
+        if name == "help":
+            print(REPL_HELP)
+            return
+        if name == "list":
+            cmd_list(self.args)
+            return
+        if name == "shell":
+            if not sys.stdin.isatty():
+                print("shell needs a terminal; use `exec` in a pipe", file=sys.stderr)
+                return
+            self.reset()
+            cmd_shell(self.args)
+            return
+        if name == "exec":
+            if rest.startswith("-- "):
+                rest = rest[3:]
+            if not rest:
+                print("usage: exec <command>", file=sys.stderr)
+                return
+            rc = run_exec(self.session(), rest, self.args.timeout)
+            if rc:
+                print(f"[status {rc}]")
+            return
+        if name in ("put", "get"):
+            parts = shlex.split(rest)
+            if len(parts) != 2:
+                usage = f"usage: {name} <local> <remote>" if name == "put" else f"usage: {name} <remote> <local>"
+                print(usage, file=sys.stderr)
+                return
+            if name == "put":
+                put_file(self.session(), parts[0], parts[1])
+            else:
+                get_file(self.session(), parts[0], parts[1])
+            return
+        if name == "setup":
+            parts = shlex.split(rest)
+            if any(part != "--force" for part in parts):
+                print("usage: setup [--force]", file=sys.stderr)
+                return
+            run_setup(self.session(), "--force" in parts)
+            return
+        print(f"unknown command {name!r}; type help", file=sys.stderr)
+
+    def loop(self) -> int:
+        interactive = sys.stdin.isatty()
+        if interactive:
+            print("CloudShell REPL — type `help` for commands, `exit` to quit.")
+        prompt = "cloudshell> " if interactive else ""
+        while True:
+            try:
+                line = input(prompt)
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not line.strip():
+                continue
+            try:
+                self.dispatch(line.strip())
+            except EOFError:
+                break
+            except SystemExit:
+                continue
+            except KeyboardInterrupt:
+                print("\ninterrupted; dropping the session", file=sys.stderr)
+                self.reset()
+            except ValueError as exc:
+                print(f"bad arguments: {exc}", file=sys.stderr)
+        return 0
+
+
+def cmd_repl(args) -> int:
+    try:
+        import readline  # noqa: F401 - line editing and history for input()
+    except ImportError:
+        pass
+    repl = Repl(args)
+    try:
+        return repl.loop()
+    finally:
+        repl.reset()
 
 
 def _remote_stat(transport, path: str) -> int:
@@ -1141,50 +1277,61 @@ def _remote_stat(transport, path: str) -> int:
         die(f"unexpected stat output for {path}: {out!r}")
 
 
+def put_file(transport, local: str, remote: str) -> int:
+    local_path = Path(local).expanduser()
+    if not local_path.is_file():
+        die(f"no such local file: {local_path}")
+    data = local_path.read_bytes()
+    quoted = shlex.quote(remote)
+    total = max(1, (len(data) + CHUNK - 1) // CHUNK)
+    for index in range(total):
+        chunk = base64.b64encode(data[index * CHUNK : (index + 1) * CHUNK]).decode()
+        op = ">" if index == 0 else ">>"
+        out, rc = transport.run(f"printf %s '{chunk}' | base64 -d {op} {quoted}\n", timeout=120)
+        if rc != 0:
+            die(f"upload failed at chunk {index + 1}/{total}: {out.strip()}")
+        log(f"uploaded chunk {index + 1}/{total} ({(index + 1) * CHUNK if index + 1 < total else len(data)} bytes)")
+    print(remote)
+    return 0
+
+
 def cmd_put(args) -> int:
     local = Path(args.local).expanduser()
     if not local.is_file():
         die(f"no such local file: {local}")
-    data = local.read_bytes()
     transport = open_transport(args)
-    remote = shlex.quote(args.remote)
     try:
-        total = max(1, (len(data) + CHUNK - 1) // CHUNK)
-        for index in range(total):
-            chunk = base64.b64encode(data[index * CHUNK : (index + 1) * CHUNK]).decode()
-            op = ">" if index == 0 else ">>"
-            out, rc = transport.run(f"printf %s '{chunk}' | base64 -d {op} {remote}\n", timeout=120)
-            if rc != 0:
-                die(f"upload failed at chunk {index + 1}/{total}: {out.strip()}")
-            log(f"uploaded chunk {index + 1}/{total} ({(index + 1) * CHUNK if index + 1 < total else len(data)} bytes)")
-        print(args.remote)
-        return 0
+        return put_file(transport, str(local), args.remote)
     finally:
         transport.close()
 
 
+def get_file(transport, remote: str, local: str) -> int:
+    quoted = shlex.quote(remote)
+    size = _remote_stat(transport, remote)
+    total = max(1, (size + CHUNK - 1) // CHUNK)
+    blob = bytearray()
+    for index in range(total):
+        cmd = f"dd if={quoted} bs={CHUNK} skip={index} count=1 2>/dev/null | base64\n"
+        out, rc = transport.run(cmd, timeout=120)
+        if rc != 0:
+            die(f"download failed at chunk {index + 1}/{total}: {out.strip()}")
+        try:
+            blob += base64.b64decode(re.sub(r"\s+", "", clean_output(out)), validate=True)
+        except ValueError as exc:
+            die(f"bad base64 from chunk {index + 1}: {exc}")
+        log(f"downloaded chunk {index + 1}/{total}")
+    if len(blob) != size:
+        die(f"size mismatch: got {len(blob)} bytes, remote file is {size}")
+    Path(local).expanduser().write_bytes(bytes(blob))
+    print(local)
+    return 0
+
+
 def cmd_get(args) -> int:
     transport = open_transport(args)
-    remote = shlex.quote(args.remote)
     try:
-        size = _remote_stat(transport, args.remote)
-        total = max(1, (size + CHUNK - 1) // CHUNK)
-        blob = bytearray()
-        for index in range(total):
-            cmd = f"dd if={remote} bs={CHUNK} skip={index} count=1 2>/dev/null | base64\n"
-            out, rc = transport.run(cmd, timeout=120)
-            if rc != 0:
-                die(f"download failed at chunk {index + 1}/{total}: {out.strip()}")
-            try:
-                blob += base64.b64decode(re.sub(r"\s+", "", clean_output(out)), validate=True)
-            except ValueError as exc:
-                die(f"bad base64 from chunk {index + 1}: {exc}")
-            log(f"downloaded chunk {index + 1}/{total}")
-        if len(blob) != size:
-            die(f"size mismatch: got {len(blob)} bytes, remote file is {size}")
-        Path(args.local).expanduser().write_bytes(bytes(blob))
-        print(args.local)
-        return 0
+        return get_file(transport, args.remote, args.local)
     finally:
         transport.close()
 
@@ -1318,9 +1465,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="AWS CloudShell from the terminal (undocumented API)",
         parents=[common],
-        epilog="run `%(prog)s <command> --help` for command-specific options",
+        epilog="run `%(prog)s <command> --help` for command-specific options; "
+        "with no command, the interactive prompt starts",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.set_defaults(func=cmd_repl, no_create=False, no_creds=False, timeout=300)
+    sub = parser.add_subparsers(dest="cmd")
 
     def add(name, func, help_text, create_flags=False):
         p = sub.add_parser(name, parents=[common], help=help_text)
@@ -1344,6 +1493,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("serve", cmd_serve, "hold a session and serve jobs over a unix socket", create_flags=True)
     p.add_argument("--no-creds", action="store_true", help="do not inject local AWS credentials")
     p.add_argument("--socket", help="socket path (default ~/.aws-cloudshell/<env-id>.sock)")
+    p = add("repl", cmd_repl, "interactive prompt over one session", create_flags=True)
+    p.add_argument("--no-creds", action="store_true", help="do not inject local AWS credentials")
+    p.add_argument("--timeout", type=int, default=300, help="seconds per `exec` command (default 300)")
     p = add("exec", cmd_exec, "run a command and print its output", create_flags=True)
     p.add_argument("--no-creds", action="store_true", help="do not inject local AWS credentials")
     p.add_argument("--timeout", type=int, default=300, help="seconds to wait for the command (default 300)")
