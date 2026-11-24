@@ -10,6 +10,8 @@ runtime, and drives `session-manager-plugin` over the resulting SSM session.
 Sessions use the `BASH` session type, so no tmux tab is created and there is
 nothing to leak.
 
+Reference: [Abusing AWS CloudShell for Data Exfiltration](https://myugan.com/posts/abusing-aws-cloudshell-for-data-exfiltration)
+
 ## Requirements
 
 - Python 3.9+
